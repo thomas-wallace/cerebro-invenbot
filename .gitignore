@@ -1,0 +1,31 @@
+# --- 🔒 SEGURIDAD (CRÍTICO: NO BORRAR) ---
+.env
+.env.local
+.env.backup
+*.key
+*.pem
+
+# --- 🐍 Python Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 📦 Entornos Virtuales (Pesan mucho, no subir) ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- 💻 IDEs y Configuración de Editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- 📂 Sistema Operativo ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- 📝 Logs y Errores ---
+*.log
+npm-debug.log*
