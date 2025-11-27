@@ -12,3 +12,4 @@ sqlalchemy
 psycopg2-binary
 asyncpg
 llama-index-storage-chat-store-postgres
+psycopg[binary]
