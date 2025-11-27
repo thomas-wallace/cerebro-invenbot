@@ -12,6 +12,9 @@ from llama_index.core.selectors import LLMSingleSelector
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.storage.chat_store.postgres import PostgresChatStore
+from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.chat_engine import CondenseQuestionChatEngine
 
 from sqlalchemy import create_engine
 from database import get_postgres_connection_string, get_supabase_client
@@ -30,13 +33,15 @@ Settings.embedding = OpenAIEmbedding(model="text-embedding-3-small", dimensions=
 
 app = FastAPI(title="MSP Intelligence Brain API")
 
-# Global Engine Variable
-query_engine = None
+# Global Variables
+router_engine = None
+chat_store_db = None
 
 class ChatInput(BaseModel):
     question: str
     user_email: str
     user_name: str
+    conversation_id: str
 
 class ChatOutput(BaseModel):
     answer: str
@@ -44,7 +49,7 @@ class ChatOutput(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global query_engine
+    global router_engine, chat_store_db
     logger.info("Initializing LlamaIndex Engines...")
 
     try:
@@ -72,9 +77,6 @@ async def startup_event():
         )
 
         # 2. Setup Vector Engine (PGVector)
-        # We use PGVectorStore to directly access the 'public.rag_chunks' table created by ingest.py
-        # instead of SupabaseVectorStore which expects a 'vecs' managed schema.
-        
         vector_store = PGVectorStore.from_params(
             database=os.environ.get("DB_NAME", "postgres"),
             host=os.environ.get("DB_HOST"),
@@ -83,11 +85,8 @@ async def startup_event():
             user=os.environ.get("DB_USER"),
             table_name="rag_chunks",
             embed_dim=1536,
-            # perform_setup=False ensures we don't try to create tables/extensions if they exist
-            # but usually it's safe to leave default (True) which checks existence.
         )
         
-        # We need an index to create a retriever
         vector_index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
         vector_query_engine = vector_index.as_query_engine()
         
@@ -100,12 +99,22 @@ async def startup_event():
         )
 
         # 3. Setup Router Engine
-        query_engine = RouterQueryEngine(
+        router_engine = RouterQueryEngine(
             selector=LLMSingleSelector.from_defaults(),
             query_engine_tools=[
                 sql_tool,
                 vector_tool,
             ],
+        )
+
+        # 4. Setup Persistent Chat Store
+        chat_store_db = PostgresChatStore.from_params(
+            host=os.environ.get("DB_HOST"),
+            port=os.environ.get("DB_PORT", "5432"),
+            database=os.environ.get("DB_NAME", "postgres"),
+            user=os.environ.get("DB_USER"),
+            password=os.environ.get("DB_PASSWORD"),
+            table_name="chat_store"
         )
         
         logger.info("LlamaIndex Engines Initialized Successfully.")
@@ -116,21 +125,31 @@ async def startup_event():
 
 @app.post("/api/chat", response_model=ChatOutput)
 async def chat_endpoint(payload: ChatInput):
-    if not query_engine:
-        raise HTTPException(status_code=503, detail="Query Engine not initialized")
+    if not router_engine or not chat_store_db:
+        raise HTTPException(status_code=503, detail="Engines not initialized")
 
     logger.info(f"Incoming request from {payload.user_email} ({payload.user_name}): {payload.question}")
 
     # Personalize System Prompt
     personalized_prompt = f"Address the user as {payload.user_name}.\n" + SYSTEM_PROMPT
     
-    # Update the LLM system prompt for this request (Context management in LlamaIndex can be tricky per-request)
-    # A simple way is to prepend the instruction to the query or use a custom prompt template.
-    # Here we will prepend to the question for simplicity in the Router context.
-    full_query = f"{personalized_prompt}\n\nUser Question: {payload.question}"
+    # Persistent Memory Logic using Supabase
+    memory = ChatMemoryBuffer.from_defaults(
+        token_limit=3000,
+        chat_store=chat_store_db,
+        chat_store_key=payload.conversation_id
+    )
+
+    # Use CondenseQuestionChatEngine to handle chat history and context
+    chat_engine = CondenseQuestionChatEngine.from_defaults(
+        query_engine=router_engine,
+        memory=memory,
+        verbose=True,
+        system_prompt=personalized_prompt # Inject system prompt here
+    )
 
     try:
-        response = query_engine.query(full_query)
+        response = chat_engine.chat(payload.question)
         
         # Extract source nodes
         source_nodes = []
