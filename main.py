@@ -141,15 +141,18 @@ async def chat_endpoint(payload: ChatInput):
     )
 
     # Use CondenseQuestionChatEngine to handle chat history and context
+    # NOTE: system_prompt is NOT supported in from_defaults for CondenseQuestionChatEngine
     chat_engine = CondenseQuestionChatEngine.from_defaults(
         query_engine=router_engine,
         memory=memory,
-        verbose=True,
-        system_prompt=personalized_prompt # Inject system prompt here
+        verbose=True
     )
 
+    # Inject system prompt by appending it to the user query
+    full_query = f"{payload.question}\n\nINSTRUCCIONES DEL SISTEMA:\n{personalized_prompt}"
+
     try:
-        response = chat_engine.chat(payload.question)
+        response = chat_engine.chat(full_query)
         
         # Extract source nodes
         source_nodes = []
