@@ -11,16 +11,15 @@ TABLES_CONFIG = [
         "table_name": "proyectos",
         "id_col": "proyectoid",
         "vector_flag": "necesitavectorizacion",
-        # Plantilla para el texto que leerá la IA
         "template": "Proyecto: {nombreproyecto}\nProblema: {problemaejecutivo}\nSolución: {solucionpropuesta}",
         "metadata_cols": ["estado", "prioridad", "tiposervicio"]
     },
     {
         "table_name": "consultores",
-        "id_col": "id",
-        "vector_flag": "necesitavectorizacion",
-        "template": "Consultor: {nombre}\nSkills: {skills}\nBio: {bio}",
-        "metadata_cols": ["nombre", "tarifa_hora"]
+        "id_col": "consultorid",
+        "vector_flag": "activo", # Usamos 'activo' como filtro ya que no tiene flag de vectorización aún
+        "template": "Consultor: {nombrecompleto}\nExpertise: {expertise}\nRol: {rolprincipal}\nSeniority: {nivelsenioridad}",
+        "metadata_cols": ["nombrecompleto", "rolprincipal"]
     },
     {
         "table_name": "leccionesaprendidas",
@@ -69,8 +68,10 @@ async def process_generic(supabase, config, embed_model):
             }
             supabase.table("rag_chunks").insert(rag_data).execute()
             
-            # Update flag
-            supabase.table(config['table_name']).update({config['vector_flag']: False}).eq(config['id_col'], row_lower.get(config['id_col'])).execute()
+            # Update flag (skip for consultores as they don't have the flag yet)
+            if config['table_name'] != "consultores":
+                supabase.table(config['table_name']).update({config['vector_flag']: False}).eq(config['id_col'], row_lower.get(config['id_col'])).execute()
+            
             print(f"Processed {config['table_name']} ID: {row_lower.get(config['id_col'])}")
             
         except KeyError as e:

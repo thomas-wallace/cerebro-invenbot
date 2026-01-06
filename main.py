@@ -78,9 +78,10 @@ async def startup_event():
         sql_tool = QueryEngineTool.from_defaults(
             query_engine=sql_query_engine,
             description=(
-                "Useful for translating a natural language query into a SQL query over tables containing: "
-                "proyectos, clientes, consultores, proyectoequipo. "
-                "Use this for questions about specific data, counts, aggregations, or structured attributes."
+                "Utilizar para consultas sobre datos exactos y estructurados. "
+                "Tablas: 'proyectos' (nombres, estados), 'clientes', 'consultores' (nombres, roles, expertise, skills, seniority), "
+                "'proyectoequipo' (asignaciones). "
+                "Usa esto para buscar personas específicas, sus roles, o listas de proyectos."
             ),
         )
 
@@ -162,17 +163,26 @@ async def chat_endpoint(payload: ChatInput):
         response_text = str(response)
         logger.info(f"Raw AI Response: {response_text}")
         
-        # Si la respuesta es vacía o el clásico "Empty Response" de LlamaIndex
-        if not response_text.strip() or response_text == "Empty Response":
-            logger.warning("IA returned empty response, formatting default JSON")
-            response_text = json.dumps({
-                "answer": "Lo siento, no encontré información en mis registros sobre eso. ¿Podrías darme más detalles o preguntar sobre otro tema?",
-                "consultants_mentioned": [],
-                "projects_mentioned": [],
-                "sources_used": []
-            })
+        # 1. Manejo de "Empty Response"
+        if not response_text.strip() or "empty response" in response_text.lower():
+            logger.warning("IA returned empty response, formatting default message")
+            final_answer = "Lo siento, no encontré información específica en mis registros sobre eso. ¿Podrías ser más específico con el nombre del proyecto o consultor?"
+        else:
+            # 2. Intentar limpiar el JSON si la IA lo mandó con markdown o texto extra
+            if "{" in response_text:
+                try:
+                    # Extraer solo el contenido entre las primeras { y últimas }
+                    start = response_text.find("{")
+                    end = response_text.rfind("}") + 1
+                    json_str = response_text[start:end]
+                    data = json.loads(json_str)
+                    final_answer = data.get("answer", response_text)
+                except:
+                    final_answer = response_text
+            else:
+                final_answer = response_text
 
-        # Extract source nodes
+        # Extract source nodes for citation
         source_nodes = []
         if response.source_nodes:
             for node in response.source_nodes:
@@ -183,7 +193,7 @@ async def chat_endpoint(payload: ChatInput):
                     source_nodes.append(node.get_content()[:100] + "...")
         
         return ChatOutput(
-            answer=response_text,
+            answer=final_answer,
             source_nodes=source_nodes
         )
 

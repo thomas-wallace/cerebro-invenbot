@@ -3,7 +3,7 @@ import json
 
 url = "http://127.0.0.1:8000/api/chat"
 payload = {
-    "question": "quien es el responsable de i+d?",
+    "question": "¿proyectos con librerías tenemos en invenzis? ",
     "user_email": "twallace@invenzis.com",
     "user_name": "Thomas",
     "conversation_id": "test_conv_123"
