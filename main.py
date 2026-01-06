@@ -1,24 +1,29 @@
 import os
 import logging
+import json
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, Header
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from llama_index.core import SQLDatabase, VectorStoreIndex, Settings
 from llama_index.core.query_engine import NLSQLTableQueryEngine, RouterQueryEngine, RetrieverQueryEngine
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.selectors import LLMSingleSelector
+from llama_index.core.selectors import LLMSingleSelector, PydanticSingleSelector
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.storage.chat_store.postgres import PostgresChatStore
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.chat_engine import CondenseQuestionChatEngine
+from llama_index.core.chat_engine import CondenseQuestionChatEngine, ContextChatEngine
 
 from sqlalchemy import create_engine
 from database import get_postgres_connection_string, get_supabase_client
-from prompts import SYSTEM_PROMPT
+from prompts import SYSTEM_PROMPT, TEXT_TO_SQL_PROMPT
+from llama_index.core import PromptTemplate  
+
+# Ingestion imports
+from ingest import process_generic, TABLES_CONFIG
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -62,9 +67,12 @@ async def startup_event():
             "stacktecnologico", "leccionesaprendidas"
         ])
         
+        text_to_sql_template = PromptTemplate(TEXT_TO_SQL_PROMPT)
+
         sql_query_engine = NLSQLTableQueryEngine(
             sql_database=sql_database,
             tables=["proyectos", "clientes", "consultores", "proyectoequipo"],
+            text_to_sql_prompt=text_to_sql_template
         )
         
         sql_tool = QueryEngineTool.from_defaults(
@@ -100,11 +108,12 @@ async def startup_event():
 
         # 3. Setup Router Engine
         router_engine = RouterQueryEngine(
-            selector=LLMSingleSelector.from_defaults(),
+            selector=PydanticSingleSelector.from_defaults(),
             query_engine_tools=[
                 sql_tool,
                 vector_tool,
             ],
+            verbose=True
         )
 
         # 4. Setup Persistent Chat Store
@@ -130,9 +139,6 @@ async def chat_endpoint(payload: ChatInput):
 
     logger.info(f"Incoming request from {payload.user_email} ({payload.user_name}): {payload.question}")
 
-    # Personalize System Prompt
-    personalized_prompt = f"Address the user as {payload.user_name}.\n" + SYSTEM_PROMPT
-    
     # Persistent Memory Logic using Supabase
     memory = ChatMemoryBuffer.from_defaults(
         token_limit=3000,
@@ -149,16 +155,27 @@ async def chat_endpoint(payload: ChatInput):
     )
 
     # Inject system prompt by appending it to the user query
-    full_query = f"{payload.question}\n\nINSTRUCCIONES DEL SISTEMA:\n{personalized_prompt}"
+    full_query = f"{payload.question}\n\nINSTRUCCIONES DEL SISTEMA:\n{SYSTEM_PROMPT}"
 
     try:
         response = chat_engine.chat(full_query)
+        response_text = str(response)
+        logger.info(f"Raw AI Response: {response_text}")
         
+        # Si la respuesta es vacía o el clásico "Empty Response" de LlamaIndex
+        if not response_text.strip() or response_text == "Empty Response":
+            logger.warning("IA returned empty response, formatting default JSON")
+            response_text = json.dumps({
+                "answer": "Lo siento, no encontré información en mis registros sobre eso. ¿Podrías darme más detalles o preguntar sobre otro tema?",
+                "consultants_mentioned": [],
+                "projects_mentioned": [],
+                "sources_used": []
+            })
+
         # Extract source nodes
         source_nodes = []
         if response.source_nodes:
             for node in response.source_nodes:
-                # Try to get meaningful metadata
                 node_meta = node.metadata
                 if node_meta:
                     source_nodes.append(str(node_meta))
@@ -166,10 +183,47 @@ async def chat_endpoint(payload: ChatInput):
                     source_nodes.append(node.get_content()[:100] + "...")
         
         return ChatOutput(
-            answer=str(response),
+            answer=response_text,
             source_nodes=source_nodes
         )
 
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def run_ingestion():
+    """
+    Background task to run the ingestion process.
+    """
+    logger.info("Starting background ingestion process...")
+    try:
+        supabase = get_supabase_client()
+        # Use the global Settings.embedding which is already initialized
+        embed_model = Settings.embedding
+        
+        for config in TABLES_CONFIG:
+            await process_generic(supabase, config, embed_model)
+            
+        logger.info("Background ingestion process completed successfully.")
+    except Exception as e:
+        logger.error(f"Background ingestion process failed: {e}")
+
+@app.post("/api/trigger-ingest")
+async def trigger_ingest(
+    background_tasks: BackgroundTasks,
+    token: str = Header(None, alias="X-Ingest-Token")
+):
+    """
+    Trigger the ingestion process manually or via external tools (e.g. n8n).
+    Requires a secret token in the X-Ingest-Token header or 'token' query param.
+    """
+    secret = os.environ.get("INGEST_SECRET")
+    if not secret:
+        raise HTTPException(status_code=500, detail="INGEST_SECRET not configured on server")
+    
+    if token != secret:
+        # Also check query param if header is missing/invalid, for easier testing
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+    background_tasks.add_task(run_ingestion)
+    return {"status": "Ingestion triggered", "message": "The ingestion process has been started in the background."}

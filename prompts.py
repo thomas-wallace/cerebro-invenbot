@@ -42,3 +42,20 @@ Debes responder ÚNICAMENTE con un objeto JSON válido.
     "sources_used": ["sql_consultores", "vector_lecciones", etc]
 }
 """
+
+TEXT_TO_SQL_PROMPT = """
+Dada una pregunta de entrada, crea una consulta SQL sintácticamente correcta para ejecutarla.
+Tablas disponibles: {schema}
+
+REGLAS CRÍTICAS:
+1. Devuelve ÚNICAMENTE el código SQL.
+2. NO incluyas bloques de markdown (```sql).
+3. NO incluyas comentarios ni explicaciones.
+4. **PROHIBIDO USAR '=' para textos.**
+5. **USA SIEMPRE 'ILIKE' con comodines '%' para buscar nombres o descripciones.**
+   - MAL: WHERE nombre = 'Constanza'
+   - BIEN: WHERE nombre ILIKE '%Constanza%'
+
+Pregunta: {query_str}
+Consulta SQL:
+"""
