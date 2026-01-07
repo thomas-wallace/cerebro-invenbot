@@ -1,44 +1,56 @@
 import os
 import logging
 import json
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, Header
+from typing import List
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from llama_index.core import SQLDatabase, VectorStoreIndex, Settings
-from llama_index.core.query_engine import NLSQLTableQueryEngine, RouterQueryEngine, RetrieverQueryEngine
-from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.selectors import LLMSingleSelector, PydanticSingleSelector
+from llama_index.core.query_engine import NLSQLTableQueryEngine, RouterQueryEngine
+from llama_index.core.tools import QueryEngineTool
+from llama_index.core.selectors import PydanticSingleSelector
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.storage.chat_store.postgres import PostgresChatStore
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.chat_engine import CondenseQuestionChatEngine, ContextChatEngine
+from llama_index.core.chat_engine import CondenseQuestionChatEngine
+from llama_index.core import PromptTemplate
 
 from sqlalchemy import create_engine
 from database import get_postgres_connection_string, get_supabase_client
-from prompts import SYSTEM_PROMPT, TEXT_TO_SQL_PROMPT
-from llama_index.core import PromptTemplate  
+from prompts import SYSTEM_PROMPT, TEXT_TO_SQL_PROMPT, CONDENSE_QUESTION_PROMPT
 
-# Ingestion imports
-from ingest import process_generic, TABLES_CONFIG
-
-# Setup Logging
+# ==========================================
+# SETUP LOGGING
+# ==========================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load Env
 load_dotenv()
 
-# Global LlamaIndex Settings
+# ==========================================
+# GLOBAL SETTINGS
+# ==========================================
 Settings.llm = OpenAI(model="gpt-4o", temperature=0)
 Settings.embedding = OpenAIEmbedding(model="text-embedding-3-small", dimensions=1536)
 
-app = FastAPI(title="MSP Intelligence Brain API")
+app = FastAPI(title="Invenzis Intelligence Brain API")
 
-# Global Variables
+# CORS para permitir requests desde n8n Cloud
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================
+# GLOBAL VARIABLES
+# ==========================================
 router_engine = None
 chat_store_db = None
 
@@ -58,13 +70,13 @@ async def startup_event():
     logger.info("Initializing LlamaIndex Engines...")
 
     try:
-        # 1. Setup SQL Engine
+        # SQL Engine
         db_url = get_postgres_connection_string()
         engine = create_engine(db_url)
-        # Use lowercase table names as Postgres stores them lowercase by default
+        
         sql_database = SQLDatabase(engine, include_tables=[
-            "proyectos", "clientes", "consultores", "proyectoequipo", 
-            "stacktecnologico", "leccionesaprendidas"
+            "proyectos", "clientes", "consultores", 
+            "proyectoequipo", "stacktecnologico", "leccionesaprendidas"
         ])
         
         text_to_sql_template = PromptTemplate(TEXT_TO_SQL_PROMPT)
@@ -72,20 +84,19 @@ async def startup_event():
         sql_query_engine = NLSQLTableQueryEngine(
             sql_database=sql_database,
             tables=["proyectos", "clientes", "consultores", "proyectoequipo"],
-            text_to_sql_prompt=text_to_sql_template
+            text_to_sql_prompt=text_to_sql_template,
+            synthesize_response=True 
         )
         
         sql_tool = QueryEngineTool.from_defaults(
             query_engine=sql_query_engine,
             description=(
-                "Utilizar para consultas sobre datos exactos y estructurados. "
-                "Tablas: 'proyectos' (nombres, estados), 'clientes', 'consultores' (nombres, roles, expertise, skills, seniority), "
-                "'proyectoequipo' (asignaciones). "
-                "Usa esto para buscar personas específicas, sus roles, o listas de proyectos."
+                "Consultas sobre datos estructurados de Invenzis: consultores, proyectos y clientes. "
+                "Usa esto para buscar personas por nombre, rol, país o expertise."
             ),
         )
 
-        # 2. Setup Vector Engine (PGVector)
+        # Vector Engine (RAG)
         vector_store = PGVectorStore.from_params(
             database=os.environ.get("DB_NAME", "postgres"),
             host=os.environ.get("DB_HOST"),
@@ -97,27 +108,24 @@ async def startup_event():
         )
         
         vector_index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
-        vector_query_engine = vector_index.as_query_engine()
+        vector_query_engine = vector_index.as_query_engine(similarity_top_k=5)
         
         vector_tool = QueryEngineTool.from_defaults(
             query_engine=vector_query_engine,
             description=(
-                "Useful for semantic search over unstructured text data like "
-                "Project Descriptions, Problems, Solutions, and Lessons Learned."
+                "Búsqueda semántica en descripciones de proyectos, problemas técnicos, "
+                "soluciones y lecciones aprendidas de Invenzis."
             ),
         )
 
-        # 3. Setup Router Engine
+        # Router Engine
         router_engine = RouterQueryEngine(
             selector=PydanticSingleSelector.from_defaults(),
-            query_engine_tools=[
-                sql_tool,
-                vector_tool,
-            ],
+            query_engine_tools=[sql_tool, vector_tool],
             verbose=True
         )
 
-        # 4. Setup Persistent Chat Store
+        # Chat Store (Memoria)
         chat_store_db = PostgresChatStore.from_params(
             host=os.environ.get("DB_HOST"),
             port=os.environ.get("DB_PORT", "5432"),
@@ -127,10 +135,10 @@ async def startup_event():
             table_name="chat_store"
         )
         
-        logger.info("LlamaIndex Engines Initialized Successfully.")
+        logger.info("✓ Engines Ready")
 
     except Exception as e:
-        logger.error(f"Failed to initialize engines: {e}")
+        logger.error(f"Startup error: {e}")
         raise e
 
 @app.post("/api/chat", response_model=ChatOutput)
@@ -138,102 +146,75 @@ async def chat_endpoint(payload: ChatInput):
     if not router_engine or not chat_store_db:
         raise HTTPException(status_code=503, detail="Engines not initialized")
 
-    logger.info(f"Incoming request from {payload.user_email} ({payload.user_name}): {payload.question}")
-
-    # Persistent Memory Logic using Supabase
-    memory = ChatMemoryBuffer.from_defaults(
-        token_limit=3000,
-        chat_store=chat_store_db,
-        chat_store_key=payload.conversation_id
-    )
-
-    # Use CondenseQuestionChatEngine to handle chat history and context
-    # NOTE: system_prompt is NOT supported in from_defaults for CondenseQuestionChatEngine
-    chat_engine = CondenseQuestionChatEngine.from_defaults(
-        query_engine=router_engine,
-        memory=memory,
-        verbose=True
-    )
-
-    # Inject system prompt by appending it to the user query
-    full_query = f"{payload.question}\n\nINSTRUCCIONES DEL SISTEMA:\n{SYSTEM_PROMPT}"
+    logger.info(f"Query from {payload.user_email}: {payload.question}")
 
     try:
-        response = chat_engine.chat(full_query)
-        response_text = str(response)
-        logger.info(f"Raw AI Response: {response_text}")
-        
-        # 1. Manejo de "Empty Response"
-        if not response_text.strip() or "empty response" in response_text.lower():
-            logger.warning("IA returned empty response, formatting default message")
-            final_answer = "Lo siento, no encontré información específica en mis registros sobre eso. ¿Podrías ser más específico con el nombre del proyecto o consultor?"
-        else:
-            # 2. Intentar limpiar el JSON si la IA lo mandó con markdown o texto extra
-            if "{" in response_text:
-                try:
-                    # Extraer solo el contenido entre las primeras { y últimas }
-                    start = response_text.find("{")
-                    end = response_text.rfind("}") + 1
-                    json_str = response_text[start:end]
-                    data = json.loads(json_str)
-                    final_answer = data.get("answer", response_text)
-                except:
-                    final_answer = response_text
-            else:
-                final_answer = response_text
-
-        # Extract source nodes for citation
-        source_nodes = []
-        if response.source_nodes:
-            for node in response.source_nodes:
-                node_meta = node.metadata
-                if node_meta:
-                    source_nodes.append(str(node_meta))
-                else:
-                    source_nodes.append(node.get_content()[:100] + "...")
-        
-        return ChatOutput(
-            answer=final_answer,
-            source_nodes=source_nodes
+        memory = ChatMemoryBuffer.from_defaults(
+            token_limit=3000,
+            chat_store=chat_store_db,
+            chat_store_key=payload.conversation_id
         )
 
-    except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        chat_engine = CondenseQuestionChatEngine.from_defaults(
+            query_engine=router_engine,
+            memory=memory,
+            condense_question_prompt=PromptTemplate(CONDENSE_QUESTION_PROMPT),
+            verbose=True
+        )
 
-async def run_ingestion():
-    """
-    Background task to run the ingestion process.
-    """
-    logger.info("Starting background ingestion process...")
-    try:
-        supabase = get_supabase_client()
-        # Use the global Settings.embedding which is already initialized
-        embed_model = Settings.embedding
-        
-        for config in TABLES_CONFIG:
-            await process_generic(supabase, config, embed_model)
-            
-        logger.info("Background ingestion process completed successfully.")
+        full_query = f"{payload.question}\n\nSYSTEM INSTRUCTIONS:\n{SYSTEM_PROMPT}"
+        response = chat_engine.chat(full_query)
+        raw_text = str(response)
+
+        # LIMPIEZA DE RESPUESTA (Parsear JSON si el LLM lo envió)
+        final_answer = raw_text
+        if "{" in raw_text:
+            try:
+                start = raw_text.find("{")
+                end = raw_text.rfind("}") + 1
+                data = json.loads(raw_text[start:end])
+                final_answer = data.get("answer", raw_text)
+            except:
+                pass
+
+        # Manejo de "no encontré nada"
+        if not final_answer.strip() or "empty response" in raw_text.lower():
+            final_answer = "No encontré información específica sobre eso en los registros de Invenzis. ¿Puedes darme más detalles?"
+
+        # Extract source nodes (Citas)
+        source_nodes = []
+        if hasattr(response, 'source_nodes'):
+            for node in response.source_nodes:
+                m = node.metadata
+                if m:
+                    info = f"Fuente: {m.get('fuentetabla', 'Documentos')} | ID: {m.get('fuenteid', 'N/A')}"
+                    source_nodes.append(info)
+
+        return ChatOutput(answer=final_answer, source_nodes=source_nodes)
+
     except Exception as e:
-        logger.error(f"Background ingestion process failed: {e}")
+        logger.error(f"Error: {e}", exc_info=True)
+        return ChatOutput(answer="Hubo un error técnico. Intenta de nuevo.", source_nodes=[])
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "ready": router_engine is not None}
 
 @app.post("/api/trigger-ingest")
-async def trigger_ingest(
-    background_tasks: BackgroundTasks,
-    token: str = Header(None, alias="X-Ingest-Token")
-):
-    """
-    Trigger the ingestion process manually or via external tools (e.g. n8n).
-    Requires a secret token in the X-Ingest-Token header or 'token' query param.
-    """
+async def trigger_ingest(background_tasks: BackgroundTasks, token: str = Header(None, alias="X-Ingest-Token")):
     secret = os.environ.get("INGEST_SECRET")
-    if not secret:
-        raise HTTPException(status_code=500, detail="INGEST_SECRET not configured on server")
+    if not secret or token != secret:
+        raise HTTPException(status_code=401)
     
-    if token != secret:
-        # Also check query param if header is missing/invalid, for easier testing
-        raise HTTPException(status_code=401, detail="Invalid or missing token")
-
+    from ingest import process_generic, TABLES_CONFIG
+    async def run_ingestion():
+        sb = get_supabase_client()
+        for cfg in TABLES_CONFIG:
+            await process_generic(sb, cfg, Settings.embedding)
+            
     background_tasks.add_task(run_ingestion)
-    return {"status": "Ingestion triggered", "message": "The ingestion process has been started in the background."}
+    return {"status": "started"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
