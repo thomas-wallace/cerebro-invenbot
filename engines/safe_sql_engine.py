@@ -5,6 +5,7 @@ This engine generates, validates, and executes SQL queries safely.
 It handles the common problem where LLMs include explanatory text with SQL,
 and provides retry logic with error context for failed queries.
 """
+import asyncio
 import logging
 import re
 from typing import Dict, List, Optional, Tuple, Any
@@ -29,6 +30,9 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+# Timeout for LLM calls (in seconds)
+LLM_TIMEOUT = 15.0
+
 
 @dataclass
 class SQLResult:
@@ -50,6 +54,7 @@ class SafeSQLEngine:
     - Validates SQL for safety (no DROP, DELETE, etc.)
     - Filters forbidden fields from results
     - Retries with error context on failure
+    - Timeout protection for LLM calls
     
     Example:
         engine = SafeSQLEngine(llm, db_url)
@@ -62,7 +67,7 @@ class SafeSQLEngine:
         self, 
         llm: OpenAI,
         db_connection_string: str,
-        max_retries: int = 3
+        max_retries: int = 2  # Reduced from 3 to avoid long waits
     ):
         """
         Initialize the SafeSQLEngine.
@@ -96,16 +101,22 @@ class SafeSQLEngine:
         
         last_error = None
         last_sql = None
+        raw_response = None
+        sql = None
         
         for attempt in range(self.max_retries):
             try:
-                # Step 1: Generate SQL
+                # Step 1: Generate SQL with timeout
                 if attempt == 0:
-                    raw_response = await self._generate_sql(question)
+                    raw_response = await asyncio.wait_for(
+                        self._generate_sql(question),
+                        timeout=LLM_TIMEOUT
+                    )
                 else:
                     # Retry with error context
-                    raw_response = await self._generate_sql_retry(
-                        question, last_sql, last_error
+                    raw_response = await asyncio.wait_for(
+                        self._generate_sql_retry(question, last_sql, last_error),
+                        timeout=LLM_TIMEOUT
                     )
                 
                 logger.debug(f"Raw LLM response: {raw_response[:200]}...")
@@ -119,7 +130,7 @@ class SafeSQLEngine:
                 if not is_safe:
                     raise ValueError(f"SQL safety check failed: {safety_error}")
                 
-                # Step 4: Filter forbidden fields
+                # Step 4: Filter forbidden fields from SQL
                 sql = filter_forbidden_fields(sql, self.settings.forbidden_fields)
                 
                 # Step 5: Execute SQL
@@ -137,23 +148,32 @@ class SafeSQLEngine:
                     retries_used=attempt
                 )
                 
+            except asyncio.TimeoutError:
+                logger.warning(f"LLM timeout (attempt {attempt + 1}/{self.max_retries})")
+                last_error = "LLM request timed out"
+                last_sql = None  # No valid SQL from timeout
+                continue
+                
             except SQLExtractionError as e:
                 logger.warning(f"SQL extraction failed (attempt {attempt + 1}): {e}")
-                last_error = str(e)
-                last_sql = raw_response if 'raw_response' in locals() else None
+                last_error = "Could not generate valid SQL query"
+                last_sql = None  # Don't pass raw response as SQL
+                continue
                 
             except SQLAlchemyError as e:
                 logger.warning(f"SQL execution failed (attempt {attempt + 1}): {e}")
                 last_error = str(e)
-                last_sql = sql if 'sql' in locals() else None
+                last_sql = sql if sql else None
+                continue
                 
             except Exception as e:
                 logger.warning(f"Query failed (attempt {attempt + 1}): {e}")
                 last_error = str(e)
-                last_sql = sql if 'sql' in locals() else None
+                last_sql = sql if sql else None
+                continue
         
         # All retries exhausted
-        logger.error(f"Query failed after {self.max_retries} attempts")
+        logger.error(f"Query failed after {self.max_retries} attempts: {last_error}")
         return SQLResult(
             success=False,
             data=[],
@@ -169,24 +189,26 @@ class SafeSQLEngine:
             question=question
         )
         
-        response = await self.llm.acomplete(prompt)
+        # Use temperature=0 for deterministic output
+        response = await self.llm.acomplete(prompt, temperature=0)
         return str(response).strip()
     
     async def _generate_sql_retry(
         self, 
         question: str, 
-        failed_sql: str, 
+        failed_sql: Optional[str], 
         error: str
     ) -> str:
         """Generate SQL with retry context after a failure."""
         prompt = SQL_RETRY_PROMPT.format(
             schema=DATABASE_SCHEMA,
             question=question,
-            failed_sql=failed_sql or "N/A",
+            failed_sql=failed_sql or "No se generó SQL válido",
             error=error
         )
         
-        response = await self.llm.acomplete(prompt)
+        # Use temperature=0 for deterministic output
+        response = await self.llm.acomplete(prompt, temperature=0)
         return str(response).strip()
     
     def _execute_sql(self, sql: str) -> List[Dict[str, Any]]:

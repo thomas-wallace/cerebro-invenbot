@@ -75,3 +75,6 @@ class QueryResult(BaseModel):
     sql_executed: Optional[str] = None
     vector_chunks: Optional[List[Dict]] = None
     error_message: Optional[str] = None
+    needs_disambiguation: bool = Field(default=False, description="True if multiple matches found and clarification needed")
+    disambiguation_message: Optional[str] = Field(None, description="Message to show when disambiguation is needed")
+

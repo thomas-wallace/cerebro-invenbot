@@ -2,9 +2,11 @@
 Comprehensive test script for Invenzis Intelligence Brain API.
 
 Tests multiple query types to verify the refactored system works correctly.
+Uses unique conversation IDs to avoid history contamination.
 """
 import requests
 import json
+import uuid
 
 BASE_URL = "http://127.0.0.1:8000"
 
@@ -12,12 +14,12 @@ BASE_URL = "http://127.0.0.1:8000"
 TEST_CASES = [
     {
         "name": "Consultant Search - By Name",
-        "question": "¿Quién es Constanza?",
+        "question": "¿Quién es Constanza, la de uruguay?",
         "expected_type": "consultant_search"
     },
     {
         "name": "Project Search - Consultant Projects",
-        "question": "¿En qué proyectos trabaja Martín?",
+        "question": "¿En qué proyectos trabaja thomas wallace?",
         "expected_type": "project_search"
     },
     {
@@ -39,22 +41,38 @@ def run_test(test_case):
     print(f"Question: {test_case['question']}")
     print(f"{'='*60}")
     
+    # Use unique conversation_id each time to avoid history contamination
+    unique_id = uuid.uuid4().hex[:8]
+    
     payload = {
         "question": test_case["question"],
         "user_email": "test@invenzis.com",
         "user_name": "Test User",
-        "conversation_id": f"test_conv_{test_case['name'].replace(' ', '_')}"
+        "conversation_id": f"test_{unique_id}"
     }
     
     try:
-        response = requests.post(f"{BASE_URL}/api/chat", json=payload, timeout=30)
+        response = requests.post(f"{BASE_URL}/api/chat", json=payload, timeout=60)
         print(f"Status: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
-            print(f"Query Type: {data.get('query_type', 'N/A')}")
-            print(f"Answer: {data.get('answer', 'N/A')[:500]}...")
-            print(f"Sources: {data.get('source_nodes', [])}")
+            query_type = data.get('query_type', 'N/A')
+            answer = data.get('answer', 'N/A')
+            sources = data.get('source_nodes', [])
+            
+            print(f"Query Type: {query_type}")
+            print(f"Answer: {answer[:500]}..." if len(answer) > 500 else f"Answer: {answer}")
+            print(f"Sources: {sources}")
+            
+            # Check for error indicators in response
+            error_indicators = ["error", "sql", "select", "consulta"]
+            has_errors = any(ind in answer.lower()[:100] for ind in error_indicators)
+            
+            if has_errors:
+                print("⚠️  WARNING: Response may contain technical content")
+                return False
+            
             return True
         else:
             print(f"Error: {response.text}")

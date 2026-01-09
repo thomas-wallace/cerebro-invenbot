@@ -44,7 +44,9 @@ class Settings(BaseSettings):
     # Fields to NEVER return (financial/sensitive data)
     forbidden_fields: List[str] = [
         "costohora", "tarifahora", "salario", "costo", 
-        "tarifa", "precio", "monto", "honorarios"
+        "tarifa", "precio", "monto", "honorarios",
+        "presupuestoestimado", "presupuestoreal", "moneda",
+        "costoanual", "costodiario", "costomensual"
     ]
     
     # Required fields for consultant responses
