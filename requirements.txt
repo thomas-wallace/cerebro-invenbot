@@ -8,6 +8,7 @@ uvicorn
 supabase
 python-dotenv
 pydantic
+pydantic-settings
 sqlalchemy
 psycopg2-binary
 asyncpg
